@@ -11,7 +11,8 @@ export interface CheckResult {
   source: string; // which provider produced the verdict
   checkedAt: string; // ISO
   price?: string;
-  note?: string; // human hint: e.g. "Not in IRNIC WHOIS — unverified"
+  note?: string; // why this verdict (shown in tooltip)
+  hint?: "not-delegated"; // UNKNOWN but absent from the TLD zone: "may be free", never "available"
   restricted?: boolean; // .ir eligibility / reserved warning
 }
 
@@ -50,6 +51,6 @@ export function labelError(label: string, tld: string): string | null {
 
 export function registrarUrl(domain: string) {
   return tldOf(domain) === "ir"
-    ? `https://www.nic.ir/` // registration is via IRNIC or an accredited reseller
+    ? `https://whois.nic.ir/` // official lookup; registration via nic.ir or an accredited reseller
     : `https://porkbun.com/checkout/search?q=${encodeURIComponent(domain)}`;
 }

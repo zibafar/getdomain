@@ -1,42 +1,49 @@
-// Server-only: domain availability providers.
-// Rule: "available" is only ever produced by an authoritative positive signal
-// (registry RDAP 404, registrar API avail=yes, IRNIC EPP avail=1). Everything else -> "unknown".
-import net from "node:net";
-import { domainToASCII } from "node:url";
+// Browser-side availability providers (no backend, no keys).
+//
+// Verified in headless Chrome (2026-11-22) from a foreign origin:
+//   - Registry RDAP servers from the IANA bootstrap send `Access-Control-Allow-Origin: *`.
+//   - Cloudflare / Google DNS-over-HTTPS send ACAO *.
+//   - rdap.org answers 404 "No RDAP service is available" for .ir / .co — an intermediary error,
+//     NOT a registry "not found". Never used.
+//   - IRNIC (whois.nic.ir web, nic.ir) blocks cross-origin requests; WHOIS :43 and EPP are not
+//     reachable from a browser. => .ir can only be confirmed REGISTERED (via DNS), never AVAILABLE.
+//
+// Rule: AVAILABLE only from an authoritative registry RDAP 404. Everything else is REGISTERED
+// (positive evidence) or UNKNOWN (with the reason).
 import { type CheckResult, type Status, labelError, tldOf } from "./domains";
 
 const now = () => new Date().toISOString();
-const result = (domain: string, status: Status, source: string, extra: Partial<CheckResult> = {}): CheckResult => ({
+const res = (domain: string, status: Status, source: string, extra: Partial<CheckResult> = {}): CheckResult => ({
   domain, status, source, checkedAt: now(), ...extra,
 });
 
-// ---------- tiny per-host throttle (in-memory) ----------
-// ponytail: per-process spacing; a shared limiter (Redis) is needed only if you run several instances.
+// Overridable for tests (simulate an unreachable service).
+export const endpoints = {
+  bootstrap: "https://data.iana.org/rdap/dns.json",
+  doh: ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"],
+};
+
+// ---------- per-host spacing (in-memory) ----------
 const gates = new Map<string, Promise<unknown>>();
 function throttle(key: string, gapMs: number) {
   const prev = gates.get(key) ?? Promise.resolve();
   gates.set(key, prev.then(() => new Promise((r) => setTimeout(r, gapMs))));
   return prev;
 }
-
-async function withRetry(fn: () => Promise<CheckResult>, tries = 2): Promise<CheckResult> {
-  let last!: CheckResult;
-  for (let i = 0; i < tries; i++) {
-    last = await fn().catch((e) => result("", "unknown", "error", { note: `Lookup failed: ${e?.message ?? e}` }));
-    if (last.status !== "unknown" || !last.note?.match(/rate|timeout|failed|HTTP 5/i)) return last;
-    await new Promise((r) => setTimeout(r, 800 * (i + 1)));
-  }
-  return last;
+function timeout(signal?: AbortSignal, ms = 10000) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(new Error("timeout")), ms);
+  signal?.addEventListener("abort", () => { clearTimeout(t); c.abort(signal.reason); }, { once: true });
+  return c.signal;
 }
 
-// ---------- RDAP (IANA bootstrap) ----------
-const RDAP_OVERRIDES: Record<string, string> = {
-  io: "https://rdap.identitydigital.services/rdap/", // not in IANA bootstrap but served (verified)
-};
+// ---------- Provider 1: authoritative registry RDAP ----------
+// Verified to serve CORS but missing from the IANA bootstrap.
+const RDAP_OVERRIDES: Record<string, string> = { io: "https://rdap.identitydigital.services/rdap/" };
 let bootstrap: Promise<Record<string, string>> | null = null;
 function rdapBases() {
-  bootstrap ??= fetch("https://data.iana.org/rdap/dns.json", { signal: AbortSignal.timeout(10000) })
-    .then((r) => r.json())
+  bootstrap ??= fetch(endpoints.bootstrap, { signal: timeout() })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`bootstrap HTTP ${r.status}`))))
     .then((j: { services: [string[], string[]][] }) => {
       const map: Record<string, string> = {};
       for (const [tlds, urls] of j.services) for (const t of tlds) map[t] = urls.find((u) => u.startsWith("https")) ?? urls[0];
@@ -46,136 +53,117 @@ function rdapBases() {
   return bootstrap;
 }
 
-export async function rdapCheck(domain: string): Promise<CheckResult> {
-  const base = (await rdapBases())[tldOf(domain)];
-  if (!base) return result(domain, "unknown", "rdap", { note: "No RDAP service for this TLD — configure a registrar API" });
+export async function rdapSupports(tld: string) {
+  return !!(await rdapBases().catch(() => ({} as Record<string, string>)))[tld];
+}
+
+/** Interpret one RDAP HTTP response. Exported for tests. */
+export function interpretRdap(domain: string, status: number, body: string, servedBy: string, expectedHost: string): CheckResult {
+  const src = `rdap:${expectedHost}`;
+  if (servedBy !== expectedHost) return res(domain, "unknown", src, { note: `Answered by ${servedBy}, not the registry` });
+  let j: Record<string, unknown> | null = null;
+  try { j = body ? JSON.parse(body) : null; } catch { /* invalid JSON handled below */ }
+  if (status === 200) {
+    if (j?.objectClassName === "domain" && String(j.ldhName ?? "").toLowerCase() === domain)
+      return res(domain, "registered", src, Array.isArray(j.status) ? { note: `Registry status: ${j.status.join(", ")}` } : {});
+    return res(domain, "unknown", src, { note: "Registry returned 200 without a valid domain object" });
+  }
+  if (status === 404) {
+    // Empty body (Verisign) or an RDAP error object with errorCode 404 is a registry "object not found".
+    const title = String(j?.title ?? "") + " " + String((j?.description as string[] | undefined)?.join(" ") ?? "");
+    if (/no rdap service|not authoritative|unsupported/i.test(title))
+      return res(domain, "unknown", src, { note: `RDAP server error: ${title.trim()}` });
+    if (!body.trim() || j?.errorCode === 404)
+      return res(domain, "available", src, { note: "Registry has no record of this domain (premium/reserved pricing not checked)" });
+    return res(domain, "unknown", src, { note: "404 with an unrecognised body" });
+  }
+  if (status === 429) return res(domain, "unknown", src, { note: "Registry rate limit (429) — retry shortly" });
+  return res(domain, "unknown", src, { note: `Registry RDAP HTTP ${status}` });
+}
+
+export async function rdapCheck(domain: string, signal?: AbortSignal): Promise<CheckResult> {
+  let base: string | undefined;
+  try { base = (await rdapBases())[tldOf(domain)]; }
+  catch { return res(domain, "unknown", "rdap", { note: "IANA RDAP bootstrap unreachable" }); }
+  if (!base) return res(domain, "unknown", "rdap", { note: `No registry RDAP service for .${tldOf(domain)}` });
   const host = new URL(base).host;
   await throttle(host, 200);
-  const res = await fetch(`${base.replace(/\/?$/, "/")}domain/${domain}`, {
-    headers: { accept: "application/rdap+json" },
-    signal: AbortSignal.timeout(10000),
-  });
-  if (res.status === 200) return result(domain, "registered", "rdap");
-  if (res.status === 404)
-    return result(domain, "available", "rdap", { note: "Not registered per registry RDAP (premium/reserved pricing not checked)" });
-  if (res.status === 429) return result(domain, "unknown", "rdap", { note: "Registry rate limit — retry shortly" });
-  return result(domain, "unknown", "rdap", { note: `Registry RDAP HTTP ${res.status}` });
-}
-
-// ---------- Porkbun registrar API (optional; adds premium + price) ----------
-const truthy = (v: unknown) => v === true || v === 1 || v === "1" || v === "yes";
-export async function porkbunCheck(domain: string): Promise<CheckResult> {
-  await throttle("porkbun", 1100); // default budget: 10 checks / 10 s
-  const res = await fetch(`https://api.porkbun.com/api/json/v3/domain/checkDomain/${domain}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apikey: process.env.PORKBUN_API_KEY, secretapikey: process.env.PORKBUN_SECRET_KEY }),
-    signal: AbortSignal.timeout(10000),
-  });
-  const j = await res.json().catch(() => null);
-  if (!res.ok || j?.status !== "SUCCESS" || !j.response || !("avail" in j.response))
-    return result(domain, "unknown", "porkbun", { note: `Registrar API: ${j?.message ?? `HTTP ${res.status}`}` });
-  const r = j.response;
-  if (!truthy(r.avail)) return result(domain, "registered", "porkbun");
-  return result(domain, truthy(r.premium) ? "premium" : "available", "porkbun", { price: r.price ? `$${r.price}` : undefined });
-}
-
-// ---------- IRNIC ----------
-function whois(host: string, query: string, timeoutMs = 10000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let out = "";
-    const s = net.connect(43, host, () => s.write(query + "\r\n"));
-    s.setTimeout(timeoutMs, () => s.destroy(new Error("WHOIS timeout")));
-    s.on("data", (d) => (out += d.toString("utf8")));
-    s.on("end", () => resolve(out));
-    s.on("error", reject);
-  });
-}
-
-const IR_RESTRICTED = /only available for registration under certain conditions/i;
-
-/** Parse IRNIC WHOIS text. Exported for tests. */
-export function parseIrnicWhois(domain: string, txt: string): CheckResult {
-  if (/^domain:\s+\S/m.test(txt))
-    return result(domain, "registered", "irnic-whois", IR_RESTRICTED.test(txt) ? { restricted: true, note: "Registered; IRNIC marks this name as restricted" } : {});
-  if (/ERROR:101|no entries found/i.test(txt))
-    // IRNIC answers ERROR:101 for invalid and reserved names too (e.g. "a.ir", "bad_name.ir"),
-    // so absence from WHOIS is NOT proof of availability.
-    return result(domain, "unknown", "irnic-whois", {
-      note: "Not in IRNIC WHOIS — likely free but unverified. Confirm at nic.ir or configure IRNIC EPP.",
+  try {
+    const r = await fetch(`${base.replace(/\/?$/, "/")}domain/${domain}`, {
+      headers: { accept: "application/rdap+json" }, signal: timeout(signal), redirect: "follow",
     });
-  if (/ERROR:\d+/.test(txt) || /limit|denied|too many/i.test(txt))
-    return result(domain, "unknown", "irnic-whois", { note: "IRNIC WHOIS refused the query (rate limit?) — retry shortly" });
-  return result(domain, "unknown", "irnic-whois", { note: "Unrecognised IRNIC WHOIS response" });
+    return interpretRdap(domain, r.status, await r.text(), new URL(r.url || base).host, host);
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return res(domain, "unknown", `rdap:${host}`, { note: `Network/CORS error: ${(e as Error).message}` });
+  }
 }
 
-export async function irnicWhoisCheck(domain: string): Promise<CheckResult> {
-  await throttle("whois.nic.ir", 1000);
-  return parseIrnicWhois(domain, await whois(process.env.IRNIC_WHOIS_HOST || "whois.nic.ir", domain));
+// ---------- Provider 2: DNS-over-HTTPS (registered-or-unknown only) ----------
+/** Interpret a DoH JSON answer for type=NS. Exported for tests. */
+export function interpretDoh(domain: string, j: { Status?: number; Answer?: { name: string; type: number }[]; Authority?: { name: string; type: number }[] }): CheckResult {
+  const strip = (n: string) => n.replace(/\.$/, "").toLowerCase();
+  if (j.Status === 0 && j.Answer?.some((a) => a.type === 2 && strip(a.name) === domain))
+    return res(domain, "registered", "dns", { note: "Delegated in DNS (has nameservers)" });
+  if (j.Status === 3 && j.Authority?.some((a) => a.type === 6 && strip(a.name) === tldOf(domain)))
+    // NXDOMAIN from the TLD zone. A name can still be registered without nameservers,
+    // on hold, reserved or restricted — so this is NOT proof of availability.
+    return res(domain, "unknown", "dns", { hint: "not-delegated", note: "Not in the TLD's DNS zone — may be free, but DNS can't prove it" });
+  return res(domain, "unknown", "dns", { note: `DNS status ${j.Status ?? "?"} — inconclusive` });
 }
 
-/** Parse an IRNIC EPP <domain:check> response. Exported for tests. */
-export function parseIrnicEpp(domain: string, xml: string): CheckResult {
-  const code = xml.match(/<result[^>]*code="(\d+)"/)?.[1];
-  if (code !== "1000")
-    return result(domain, "unknown", "irnic-epp", { note: `IRNIC EPP code ${code ?? "?"}: ${xml.match(/<msg[^>]*>([^<]*)/)?.[1] ?? "no message"}` });
-  const avail = xml.match(/<(?:\w+:)?name[^>]*\savail="(\w+)"/)?.[1];
-  const reason = xml.match(/<(?:\w+:)?reason[^>]*>([^<]*)/)?.[1];
-  if (avail === "1" || avail === "true") return result(domain, "available", "irnic-epp");
-  if (avail === "0" || avail === "false") return result(domain, "registered", "irnic-epp", reason ? { note: reason } : {});
-  return result(domain, "unknown", "irnic-epp", { note: "EPP response had no avail flag" });
+export async function dohCheck(domain: string, signal?: AbortSignal): Promise<CheckResult> {
+  for (const ep of endpoints.doh) {
+    await throttle(ep, 50);
+    try {
+      const r = await fetch(`${ep}?name=${encodeURIComponent(domain)}&type=NS`, {
+        headers: { accept: "application/dns-json" }, signal: timeout(signal, 8000),
+      });
+      if (r.ok) return interpretDoh(domain, await r.json());
+    } catch (e) {
+      if (signal?.aborted) throw e;
+    }
+  }
+  return res(domain, "unknown", "dns", { note: "DNS-over-HTTPS resolvers unreachable" });
 }
 
-// IRNIC EPP-over-HTTPS (reseller/نماینده credentials). Shape follows IRNIC's domain-1.0 namespace.
-export async function irnicEppCheck(domain: string): Promise<CheckResult> {
-  await throttle("epp.nic.ir", 500);
-  const xml =
-    `<?xml version="1.0" encoding="UTF-8" standalone="no"?><epp xmlns="urn:ietf:params:xml:ns:epp-1.0"><command><check>` +
-    `<domain:check xmlns:domain="http://epp.nic.ir/ns/domain-1.0"><domain:name>${domain}</domain:name>` +
-    `<domain:authInfo><domain:pw>${process.env.IRNIC_DEPOSIT_CODE ?? ""}</domain:pw></domain:authInfo></domain:check></check>` +
-    `<clTRID>DF-${Date.now()}</clTRID></command></epp>`;
-  const res = await fetch(process.env.IRNIC_EPP_URL || "https://epp.nic.ir/submit", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${process.env.IRNIC_EPP_TOKEN}`, "Content-Type": "application/xml", Accept: "application/xml" },
-    body: xml,
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) return result(domain, "unknown", "irnic-epp", { note: `IRNIC EPP HTTP ${res.status}` });
-  return parseIrnicEpp(domain, await res.text());
+// ---------- chain ----------
+export function normalize(input: string): { domain: string; error?: string } {
+  let ascii = "";
+  try { ascii = new URL("http://" + input.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "")).hostname; } catch { /* invalid */ }
+  if (!ascii || !ascii.includes(".")) return { domain: input, error: "Invalid domain" };
+  const dot = ascii.indexOf(".");
+  return { domain: ascii, error: labelError(ascii.slice(0, dot), ascii.slice(dot + 1)) ?? undefined };
 }
-
-// ---------- entry point ----------
-export const providers = {
-  ir: () => (process.env.IRNIC_EPP_TOKEN ? "irnic-epp" : "irnic-whois"),
-  other: () => (process.env.PORKBUN_API_KEY && process.env.PORKBUN_SECRET_KEY ? "porkbun → rdap" : "rdap"),
-};
 
 const cache = new Map<string, { r: CheckResult; exp: number }>();
 const TTL: Record<Status, number> = { registered: 6 * 3600e3, available: 10 * 60e3, premium: 30 * 60e3, unknown: 0 };
 
-export function normalize(input: string): { domain: string; error?: string } {
-  const ascii = domainToASCII(input.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, ""));
-  if (!ascii || !ascii.includes(".")) return { domain: input, error: "Invalid domain" };
-  const dot = ascii.indexOf(".");
-  const error = labelError(ascii.slice(0, dot), ascii.slice(dot + 1));
-  return { domain: ascii, error: error ?? undefined };
-}
-
-export async function checkDomain(input: string, fresh = false): Promise<CheckResult> {
+/**
+ * Provider chain:
+ *   .ir                -> DNS only (IRNIC is not browser-reachable): REGISTERED or UNKNOWN.
+ *   RDAP-capable TLDs  -> registry RDAP; if inconclusive, DNS may still prove REGISTERED.
+ *   other TLDs (.co…)  -> DNS only: REGISTERED or UNKNOWN.
+ */
+export async function checkDomain(input: string, fresh = false, signal?: AbortSignal): Promise<CheckResult> {
   const { domain, error } = normalize(input);
-  if (error) return result(domain, "unknown", "validation", { note: error, restricted: tldOf(domain) === "ir" });
+  if (error) return res(domain, "unknown", "validation", { note: error, restricted: tldOf(domain) === "ir" });
   const hit = cache.get(domain);
   if (!fresh && hit && hit.exp > Date.now()) return hit.r;
 
   const tld = tldOf(domain);
   let r: CheckResult;
-  if (tld === "ir") {
-    r = await withRetry(() => (process.env.IRNIC_EPP_TOKEN ? irnicEppCheck(domain) : irnicWhoisCheck(domain)));
+  if (tld !== "ir" && (await rdapSupports(tld))) {
+    r = await rdapCheck(domain, signal);
+    if (r.status === "unknown") {
+      const d = await dohCheck(domain, signal);
+      if (d.status === "registered") r = { ...d, note: `${d.note}; RDAP: ${r.note}` };
+    }
   } else {
-    r = process.env.PORKBUN_API_KEY ? await withRetry(() => porkbunCheck(domain)) : result(domain, "unknown", "none");
-    if (r.status === "unknown") r = await withRetry(() => rdapCheck(domain));
+    r = await dohCheck(domain, signal);
+    if (tld === "ir" && r.status === "unknown")
+      r.note = (r.note ?? "") + ". IRNIC offers no browser-accessible lookup; verify at whois.nic.ir.";
   }
-  r.domain = domain;
   if (TTL[r.status]) cache.set(domain, { r, exp: Date.now() + TTL[r.status] });
   return r;
 }

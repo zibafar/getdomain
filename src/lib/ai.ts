@@ -1,121 +1,152 @@
-// Server-only: AI providers via plain fetch (keys never leave the server).
+// In-browser AI via WebLLM (WebGPU). No server, no API keys. Weights are cached by the browser.
+import type { InitProgressReport, MLCEngineInterface } from "@mlc-ai/web-llm";
 import type { Suggestion } from "./domains";
 
-export type ProviderId = "anthropic" | "openai" | "gemini" | "compatible";
+export const MODELS = [
+  { id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC", label: "Qwen 2.5 · 1.5B", size: "≈1.6 GB", note: "recommended · multilingual" },
+  { id: "Qwen2.5-0.5B-Instruct-q4f16_1-MLC", label: "Qwen 2.5 · 0.5B", size: "≈0.9 GB", note: "fastest" },
+  { id: "Qwen2.5-3B-Instruct-q4f16_1-MLC", label: "Qwen 2.5 · 3B", size: "≈2.5 GB", note: "best quality" },
+  { id: "Llama-3.2-3B-Instruct-q4f16_1-MLC", label: "Llama 3.2 · 3B", size: "≈2.3 GB", note: "" },
+  { id: "gemma-2-2b-it-q4f16_1-MLC", label: "Gemma 2 · 2B", size: "≈1.9 GB", note: "" },
+] as const;
 
-const env = process.env;
-export const PROVIDERS: Record<ProviderId, { label: string; ready: () => boolean; model: () => string }> = {
-  anthropic: { label: "Anthropic Claude", ready: () => !!env.ANTHROPIC_API_KEY, model: () => env.ANTHROPIC_MODEL || "claude-opus-5-5" },
-  openai: { label: "OpenAI", ready: () => !!env.OPENAI_API_KEY, model: () => env.OPENAI_MODEL || "gpt-4.1-mini" },
-  gemini: { label: "Google Gemini", ready: () => !!env.GEMINI_API_KEY, model: () => env.GEMINI_MODEL || "gemini-2.5-flash" },
-  compatible: {
-    label: "OpenAI-compatible",
-    ready: () => !!env.COMPAT_BASE_URL,
-    model: () => env.COMPAT_MODEL || "llama3.1",
-  },
-};
-
-export const readyProviders = () =>
-  (Object.keys(PROVIDERS) as ProviderId[]).filter((p) => PROVIDERS[p].ready()).map((id) => ({ id, label: PROVIDERS[id].label, model: PROVIDERS[id].model() }));
-
-async function post(url: string, headers: Record<string, string>, body: unknown) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
-  });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`${res.status}: ${j?.error?.message ?? j?.message ?? res.statusText}`);
-  return j;
-}
-
-async function complete(provider: ProviderId, model: string, system: string, user: string): Promise<string> {
-  switch (provider) {
-    case "anthropic": {
-      const j = await post(
-        "https://api.anthropic.com/v1/messages",
-        { "x-api-key": env.ANTHROPIC_API_KEY!, "anthropic-version": "2023-06-01" },
-        { model, max_tokens: 16000, output_config: { effort: "low" }, system, messages: [{ role: "user", content: user }] },
-      );
-      if (j.stop_reason === "refusal") throw new Error("The model declined this request");
-      return (j.content ?? []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("");
-    }
-    case "gemini": {
-      const j = await post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        { "x-goog-api-key": env.GEMINI_API_KEY! },
-        {
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: user }] }],
-          generationConfig: { responseMimeType: "application/json" },
-        },
-      );
-      return j.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text ?? "").join("") ?? "";
-    }
-    default: {
-      const base = provider === "openai" ? "https://api.openai.com/v1" : env.COMPAT_BASE_URL!.replace(/\/$/, "");
-      const key = provider === "openai" ? env.OPENAI_API_KEY : env.COMPAT_API_KEY;
-      const j = await post(`${base}/chat/completions`, key ? { Authorization: `Bearer ${key}` } : {}, {
-        model,
-        response_format: { type: "json_object" },
-        messages: [{ role: "system", content: system }, { role: "user", content: user }],
-      });
-      return j.choices?.[0]?.message?.content ?? "";
-    }
+/** True only if a real GPU adapter is available ("gpu" in navigator alone is not enough). */
+export async function hasWebGPU(): Promise<boolean> {
+  try {
+    const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+    return !!(gpu && (await gpu.requestAdapter()));
+  } catch {
+    return false;
   }
 }
 
-const SYSTEM = `You are a senior brand-naming strategist for global and Iranian markets.
-Return ONLY JSON: {"suggestions":[{"name":"label-without-tld","style":"...","score":0-100,"reason":"...","scores":{"brandability":0-100,"memorability":0-100,"pronunciation":0-100,"length":0-100,"relevance":0-100,"international":0-100}}]}
-Rules:
-- "name" is the second-level label only: lowercase a-z, 0-9, hyphen; 3-20 chars; no TLD, no spaces, no leading/trailing hyphen.
-- style is one of: brandable, invented, keyword, prefix-suffix, spelling, persian, international, short.
-- Include at least 6 "persian" names: Persian words or Persian-inspired roots written in Latin letters (Finglish) that read well for Iranians and are pronounceable abroad, suited to .ir.
-- Mix creative brandables, invented words, industry terms, alternative spellings, prefix/suffix combos (get-, try-, -hub, -ly, -io...), short names, and close variations of the brand name itself.
-- No near-duplicates, no generic filler.
-- score is your opinion of name quality only. You do NOT know whether any domain is available; never mention availability.
-- reason: one short sentence (max 18 words) in the requested language.`;
+let engine: Promise<MLCEngineInterface> | null = null;
+let current = "";
+
+export async function loadModel(model: string, onProgress: (r: InitProgressReport) => void): Promise<MLCEngineInterface> {
+  if (!engine) {
+    const { CreateWebWorkerMLCEngine } = await import("@mlc-ai/web-llm");
+    current = model;
+    engine = CreateWebWorkerMLCEngine(
+      new Worker(new URL("./llm.worker.ts", import.meta.url), { type: "module" }),
+      model,
+      { initProgressCallback: onProgress },
+    );
+    engine.catch(() => { engine = null; current = ""; });
+    return engine;
+  }
+  const e = await engine;
+  e.setInitProgressCallback(onProgress);
+  if (current !== model) { current = model; await e.reload(model); }
+  return e;
+}
+
+const SYSTEM = `You are a brand-naming expert for global and Iranian markets. Output JSON only.
+Each suggestion: "name" = second-level label only (lowercase a-z, 0-9, hyphen; 3-20 chars; no TLD, no spaces).
+"style" is one of: brandable, invented, keyword, prefix-suffix, spelling, persian, international, short.
+Include several "persian" names: Persian words/roots in Latin letters (Finglish), easy to say abroad, good for .ir.
+Mix invented words, industry terms, alternative spellings, prefix/suffix combos and short names. No duplicates.
+"score" (0-100) and "scores" rate only the NAME. You do not know if any domain is available; never claim it.
+"reason": one short sentence.`;
+
+const SCORE = { type: "integer" };
+const SCHEMA = {
+  type: "object",
+  properties: {
+    suggestions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" }, style: { type: "string" }, score: SCORE, reason: { type: "string" },
+          scores: {
+            type: "object",
+            properties: { brandability: SCORE, memorability: SCORE, pronunciation: SCORE, length: SCORE, relevance: SCORE, international: SCORE },
+            required: ["brandability", "memorability", "pronunciation", "length", "relevance", "international"],
+          },
+        },
+        required: ["name", "style", "score", "reason", "scores"],
+      },
+    },
+  },
+  required: ["suggestions"],
+};
 
 export async function generateSuggestions(opts: {
-  provider: ProviderId; model?: string; name: string; description: string; industry?: string; keywords?: string; tlds: string[]; lang: "en" | "fa"; count?: number;
+  model: string; name: string; description: string; industry?: string; keywords?: string; tlds: string[]; lang: "en" | "fa";
+  signal: AbortSignal; onLoad: (r: InitProgressReport) => void; onCount: (n: number) => void;
 }): Promise<Suggestion[]> {
-  const p = PROVIDERS[opts.provider];
-  if (!p?.ready()) throw new Error(`AI provider "${opts.provider}" is not configured on the server`);
+  const e = await loadModel(opts.model, opts.onLoad);
   const user = [
     `Brand/project: ${opts.name || "(none yet)"}`,
     `Description: ${opts.description}`,
     opts.industry && `Industry: ${opts.industry}`,
     opts.keywords && `Keywords: ${opts.keywords}`,
-    `Target TLDs: ${opts.tlds.map((t) => "." + t).join(" ")}${opts.tlds.includes("ir") ? " (.ir is a priority: Iranian market)" : ""}`,
+    `Target extensions: ${opts.tlds.map((t) => "." + t).join(" ")}${opts.tlds.includes("ir") ? " (.ir is a priority: Iranian market)" : ""}`,
     `Write "reason" in ${opts.lang === "fa" ? "Persian (Farsi)" : "English"}.`,
-    `Generate ${opts.count ?? 32} suggestions.`,
+    `Give 30 suggestions.`,
   ].filter(Boolean).join("\n");
 
-  const text = await complete(opts.provider, opts.model || p.model(), SYSTEM, user);
+  const stream = await e.chat.completions.create({
+    messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }],
+    stream: true,
+    temperature: 0.9,
+    max_tokens: 3500,
+    response_format: { type: "json_object", schema: JSON.stringify(SCHEMA) },
+  });
+  let text = "";
+  for await (const chunk of stream) {
+    if (opts.signal.aborted) { e.interruptGenerate(); throw new DOMException("Aborted", "AbortError"); }
+    text += chunk.choices[0]?.delta?.content ?? "";
+    opts.onCount((text.match(/"name"/g) ?? []).length);
+  }
   return parseSuggestions(text);
 }
 
-/** Tolerant JSON extraction + sanitising. Exported for tests. */
+/** Tolerant JSON extraction + sanitising (also salvages a truncated array). Exported for tests. */
 export function parseSuggestions(text: string): Suggestion[] {
-  const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  let data: { suggestions?: unknown };
-  try { data = JSON.parse(json); } catch { throw new Error("AI returned malformed JSON"); }
+  let items: Record<string, unknown>[] = [];
+  try {
+    items = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)).suggestions ?? [];
+  } catch {
+    // truncated output: keep every complete {...} object that has a name
+    for (const m of text.matchAll(/\{[^{}]*"name"[^{}]*(\{[^{}]*\})?[^{}]*\}/g)) {
+      try { items.push(JSON.parse(m[0])); } catch { /* skip partial */ }
+    }
+  }
   const seen = new Set<string>();
+  const clamp = (n: unknown) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
   const out: Suggestion[] = [];
-  for (const s of (Array.isArray(data.suggestions) ? data.suggestions : []) as Record<string, unknown>[]) {
+  for (const s of Array.isArray(items) ? items : []) {
     const name = String(s.name ?? "").toLowerCase().replace(/\.[a-z.]+$/, "").replace(/[^a-z0-9-]/g, "").replace(/^-+|-+$/g, "");
-    if (name.length < 3 || seen.has(name)) continue;
+    if (name.length < 3 || name.length > 30 || seen.has(name)) continue;
     seen.add(name);
-    const clamp = (n: unknown) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
     out.push({
-      name,
-      style: String(s.style ?? "brandable"),
-      score: clamp(s.score),
-      reason: String(s.reason ?? "").slice(0, 200),
+      name, style: String(s.style ?? "brandable"), score: clamp(s.score), reason: String(s.reason ?? "").slice(0, 200),
       scores: Object.fromEntries(Object.entries((s.scores as Record<string, unknown>) ?? {}).map(([k, v]) => [k, clamp(v)])),
     });
   }
-  if (!out.length) throw new Error("AI returned no usable suggestions");
+  if (!out.length) throw new Error("The model returned no usable suggestions — try again or pick a larger model");
   return out;
+}
+
+// ---------- fallback without WebGPU: deterministic combinations, clearly labelled ----------
+const PRE = ["get", "try", "go", "my", "hey"];
+const SUF = ["hub", "ly", "lab", "app", "io", "yar", "ban", "sara", "kade", "estan", "now"]; // yar/ban/sara/kade/estan: Persian suffixes
+export function heuristicSuggestions(name: string, keywords: string): Suggestion[] {
+  const words = [name, ...keywords.split(/[,،\s]+/)].map((w) => w.toLowerCase().replace(/[^a-z0-9]/g, "")).filter((w) => w.length >= 2);
+  const out = new Map<string, Suggestion>();
+  const add = (n: string, style: string) => {
+    if (n.length < 3 || n.length > 20 || out.has(n)) return;
+    const score = Math.max(20, 95 - Math.max(0, n.length - 6) * 6 - (n.includes("-") ? 10 : 0));
+    out.set(n, { name: n, style, score, reason: "Heuristic combination (no AI): score reflects length only" });
+  };
+  for (const w of words) {
+    add(w, "keyword");
+    SUF.forEach((s, i) => add(w + s, i >= 5 ? "persian" : "prefix-suffix"));
+    PRE.forEach((p) => add(p + w, "prefix-suffix"));
+    if (w.length > 5) add(w.replace(/[aeiou]/g, "").slice(0, 6), "short");
+  }
+  for (const a of words) for (const b of words) if (a !== b) add(a + b, "keyword");
+  return [...out.values()].slice(0, 40);
 }
